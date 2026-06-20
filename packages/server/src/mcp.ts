@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolve, basename, extname } from "path";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
+import { readdir, readFile, stat } from "fs/promises";
 import { randomUUID } from "crypto";
 import { CodeCacheStore, FileWatcher, MetricsMonitor, TokenTracker } from "@code-cache/sdk";
 
@@ -10,19 +11,19 @@ const SOURCE_EXTENSIONS = new Set([".java", ".ts", ".tsx", ".js", ".mjs", ".jsx"
 const SKIP_DIRS = new Set(["node_modules", ".git", ".code-cache", "dist", "build", "target", "__pycache__"]);
 
 /** Walk root, return all source files whose filename or content contains symbol. */
-function findFilesContainingSymbol(symbol: string, root: string, maxFiles = 100): string[] {
+async function findFilesContainingSymbol(symbol: string, root: string, maxFiles = 100): Promise<string[]> {
   const found: string[] = [];
   const lower = symbol.toLowerCase();
   const queue = [root];
   while (queue.length > 0 && found.length < maxFiles) {
     const dir = queue.shift()!;
-    let entries;
-    try { entries = readdirSync(dir); } catch { continue; }
+    let entries: string[];
+    try { entries = await readdir(dir); } catch { continue; }
     for (const entry of entries) {
       if (SKIP_DIRS.has(entry)) continue;
       const full = `${dir}/${entry}`;
       let st;
-      try { st = statSync(full); } catch { continue; }
+      try { st = await stat(full); } catch { continue; }
       if (st.isDirectory()) { queue.push(full); continue; }
       const ext = extname(entry);
       if (!SOURCE_EXTENSIONS.has(ext)) continue;
@@ -31,7 +32,7 @@ function findFilesContainingSymbol(symbol: string, root: string, maxFiles = 100)
         found.push(full);
       } else {
         try {
-          const content = readFileSync(full, "utf-8");
+          const content = await readFile(full, "utf-8");
           if (content.includes(symbol)) found.push(full);
         } catch { /* skip unreadable */ }
       }
@@ -42,18 +43,18 @@ function findFilesContainingSymbol(symbol: string, root: string, maxFiles = 100)
 }
 
 /** Walk root, return all source files. */
-function collectSourceFiles(root: string): string[] {
+async function collectSourceFiles(root: string): Promise<string[]> {
   const files: string[] = [];
   const queue = [root];
   while (queue.length > 0) {
     const dir = queue.shift()!;
-    let entries;
-    try { entries = readdirSync(dir); } catch { continue; }
+    let entries: string[];
+    try { entries = await readdir(dir); } catch { continue; }
     for (const entry of entries) {
       if (SKIP_DIRS.has(entry)) continue;
       const full = `${dir}/${entry}`;
       let st;
-      try { st = statSync(full); } catch { continue; }
+      try { st = await stat(full); } catch { continue; }
       if (st.isDirectory()) { queue.push(full); continue; }
       if (SOURCE_EXTENSIONS.has(extname(entry))) files.push(full);
     }
@@ -186,10 +187,14 @@ For best results on a new project, call index_directory first.`,
           if (params.file_path) {
             filesToIndex = [params.file_path];
           } else if (params.symbol) {
-            filesToIndex = findFilesContainingSymbol(params.symbol, searchRoot);
+            filesToIndex = await findFilesContainingSymbol(params.symbol, searchRoot);
           }
           if (filesToIndex.length > 0) {
-            await Promise.all(filesToIndex.map(p => cache.storeFile(p, {})));
+            const CONCURRENCY = 4;
+            for (let i = 0; i < filesToIndex.length; i += CONCURRENCY) {
+              const batch = filesToIndex.slice(i, i + CONCURRENCY);
+              await Promise.all(batch.map(p => cache.storeFile(p, {})));
+            }
             result = await cache.queryBySymbol(params);
             autoIndexedFiles = filesToIndex;
             // Record each auto-indexed file as a store in metrics
@@ -287,7 +292,7 @@ Returns counts of files indexed, symbols extracted, and any errors.`,
         if (!existsSync(absDir)) {
           return { content: [{ type: "text" as const, text: `Error: directory not found: ${absDir}` }], isError: true };
         }
-        const files = collectSourceFiles(absDir);
+        const files = await collectSourceFiles(absDir);
         let filesIndexed = 0;
         let filesSkipped = 0;
         let symbolsTotal = 0;
@@ -441,9 +446,11 @@ The FileWatcher calls this automatically on file changes, but you can call it ex
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  process.on("SIGINT", async () => {
+  const shutdown = async () => {
     watcher.close();
     await monitor.close();
     process.exit(0);
-  });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }

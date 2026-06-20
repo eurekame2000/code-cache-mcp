@@ -1,11 +1,10 @@
-import { readFileSync } from "fs";
+import { readFile } from "fs/promises";
 import { resolve } from "path";
 import type { CacheConfig, StoreResult, QueryResult, SymbolHit, CacheStats, AiLocation, InvalidateResult } from "./types.js";
 import {
   initDb, contentHash, insertFileVersion, getStoredHash,
   insertSymbol, insertAstNode, insertRelationship, insertCallEdge,
   insertAiLocation, deleteByFilePath, resolveParentFks, incrementStat, batchIncrementStats,
-  loadEmbeddingsMap,
   type Db,
 } from "./db.js";
 import { detectLanguage, getParser, initParsers } from "./parser-registry.js";
@@ -24,10 +23,9 @@ export class CodeCacheStore {
   private dbPath: string;
   private sessionId: string;
   private initialized = false;
-  private embeddingCache: Map<number, number[]> | null = null;
-  private embeddingCacheDirty = true;
   private symbolNameIndex: SymbolIndexEntry[] = [];
   private symbolIndexDirty = true;
+  private fileIndexLocks = new Map<string, Promise<StoreResult>>();
 
   constructor(config: CacheConfig) {
     this.dbPath = config.dbPath;
@@ -48,9 +46,35 @@ export class CodeCacheStore {
 
   async storeFile(filePath: string, options?: { language?: string }): Promise<StoreResult> {
     await this.init();
-    const db = this.getDb();
     const absPath = resolve(filePath);
-    const source = readFileSync(absPath, "utf-8");
+
+    // Dedup concurrent indexing of the same file path
+    const existing = this.fileIndexLocks.get(absPath);
+    if (existing) {
+      const result = await existing;
+      // If the other request already indexed this file with the same content, return cached
+      const db = this.getDb();
+      const source = await readFile(absPath, "utf-8");
+      const hash = contentHash(source);
+      const storedHash = await getStoredHash(db, absPath);
+      if (storedHash === hash) {
+        return { ...result, was_cached: true };
+      }
+      // File changed since the other request locked — proceed to re-index
+    }
+
+    const promise = this._doStoreFile(absPath, options);
+    this.fileIndexLocks.set(absPath, promise);
+    try {
+      return await promise;
+    } finally {
+      this.fileIndexLocks.delete(absPath);
+    }
+  }
+
+  private async _doStoreFile(absPath: string, options?: { language?: string }): Promise<StoreResult> {
+    const db = this.getDb();
+    const source = await readFile(absPath, "utf-8");
     const hash = contentHash(source);
     const lines = source.split("\n").length;
 
@@ -122,7 +146,6 @@ export class CodeCacheStore {
     const newSymbolRows = await db.prepare(
       "SELECT id, symbol_kind, symbol_name, signature FROM symbols WHERE file_path = ? AND file_hash = ?"
     ).all(absPath, hash) as any[];
-    this.embeddingCacheDirty = true;
     this.symbolIndexDirty = true;
     generateEmbeddings(db, newSymbolRows).catch(() => {});
 
@@ -156,12 +179,7 @@ export class CodeCacheStore {
     // ── Semantic search path ────────────────────────────────────────────────
     let semanticScores = new Map<number, number>(); // symbol_id → score
     if (params.semantic_query) {
-      // Reload embedding cache only when dirty (new files indexed since last query)
-      if (this.embeddingCacheDirty || !this.embeddingCache) {
-        this.embeddingCache = await loadEmbeddingsMap(db);
-        this.embeddingCacheDirty = false;
-      }
-      const semHits = await semanticSearch(db, params.semantic_query, limit, 0.3, this.embeddingCache);
+      const semHits = await semanticSearch(db, params.semantic_query, limit, 0.3);
       for (const h of semHits) semanticScores.set(h.symbol_id, h.score);
     }
 
@@ -403,7 +421,7 @@ export class CodeCacheStore {
 
     let fileHash = "";
     try {
-      const source = readFileSync(absPath, "utf-8");
+      const source = await readFile(absPath, "utf-8");
       fileHash = contentHash(source);
     } catch { /* file may not exist */ }
 
@@ -470,7 +488,6 @@ export class CodeCacheStore {
     const absPath = resolve(filePath);
     const removed = await deleteByFilePath(db, absPath);
     this.symbolIndexDirty = true;
-    this.embeddingCacheDirty = true;
     return { file_path: absPath, symbols_removed: removed };
   }
 
@@ -516,10 +533,9 @@ export class CodeCacheStore {
       DELETE FROM session_stats;
       UPDATE stats SET value = 0;
     `);
-    this.embeddingCache = null;
-    this.embeddingCacheDirty = true;
     this.symbolNameIndex = [];
     this.symbolIndexDirty = true;
+    this.fileIndexLocks.clear();
   }
 
   async onFileChanged(filePath: string): Promise<void> {
