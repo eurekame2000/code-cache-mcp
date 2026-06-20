@@ -24,8 +24,8 @@
     "zod": "^3.24.0"
   },
   "optionalDependencies": {
-    "pg": "^8.11.0",
-    "@anthropic-ai/sdk": "^0.55.0"
+    "@anthropic-ai/sdk": "^0.55.0",
+    "pg": "^8.11.0"
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",
