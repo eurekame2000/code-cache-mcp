@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.code-cache/
+.model-cache/
+*.db
+*.db-shm
+*.db-wal
+
+# Dev notes
+db-queries.md
+
+# Teaching workspace
+lessons/
+learning-records/
+reference/
+MISSION.md
+RESOURCES.md
+NOTES.md
+.DS_Store
