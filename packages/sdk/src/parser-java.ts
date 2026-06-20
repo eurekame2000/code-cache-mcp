@@ -22,6 +22,23 @@ function sliceSource(source: string, node: Parser.SyntaxNode): string {
   return source.slice(node.startIndex, node.endIndex);
 }
 
+function buildJavaSignature(node: Parser.SyntaxNode, name: string, source: string): string {
+  const params: string[] = [];
+  const paramList = node.childForFieldName("parameters");
+  if (paramList) {
+    for (const p of paramList.children) {
+      if (p.type === "formal_parameter" || p.type === "spread_parameter") {
+        const t = p.childForFieldName("type");
+        const n = p.childForFieldName("name");
+        params.push([t, n].filter(Boolean).map(x => sliceSource(source, x!)).join(" ").trim());
+      }
+    }
+  }
+  const ret = node.childForFieldName("type"); // null for constructor
+  const retStr = ret ? `: ${sliceSource(source, ret)}` : "";
+  return `${name}(${params.join(", ")})${retStr}`.replace(/\s+/g, " ");
+}
+
 function extractRelationships(
   classNode: Parser.SyntaxNode,
   source: string
@@ -116,6 +133,7 @@ function visitBody(
         start_line: child.startPosition.row + 1,
         end_line: child.endPosition.row + 1,
         parent_id: parentSymbolIndex,
+        signature: buildJavaSignature(child, name, source),
       });
 
       // Extract method calls from body

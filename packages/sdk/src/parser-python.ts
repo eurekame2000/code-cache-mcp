@@ -22,6 +22,14 @@ function sliceSource(source: string, node: Parser.SyntaxNode): string {
   return source.slice(node.startIndex, node.endIndex);
 }
 
+function buildPySignature(node: Parser.SyntaxNode, name: string, source: string): string {
+  const params = node.childForFieldName("parameters");
+  const ret = node.childForFieldName("return_type");
+  const p = params ? sliceSource(source, params) : "()";
+  const r = ret ? `: ${sliceSource(source, ret)}` : "";
+  return `${name}${p}${r}`.replace(/\s+/g, " ");
+}
+
 function extractCallsFromBody(
   bodyNode: Parser.SyntaxNode,
   source: string
@@ -93,6 +101,7 @@ function visitNode(
       symbol_kind: kind as any, start_line: node.startPosition.row + 1,
       end_line: node.endPosition.row + 1,
       parent_id: parentIdx,
+      signature: buildPySignature(node, name, source),
     });
 
     const bodyNode = node.childForFieldName("body");

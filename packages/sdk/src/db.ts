@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS symbols (
   start_line     INTEGER NOT NULL,
   end_line       INTEGER NOT NULL,
   parent_id      INTEGER,
+  signature      TEXT,
   FOREIGN KEY (parent_id) REFERENCES symbols(id)
 );
 
@@ -137,6 +138,8 @@ export async function initDb(dbPath: string): Promise<Db> {
   // Migrate old DBs that stored raw code
   try { await db.exec("ALTER TABLE file_versions DROP COLUMN content"); } catch { /* already gone or new DB */ }
   try { await db.exec("ALTER TABLE symbols DROP COLUMN source_snippet"); } catch { /* already gone or new DB */ }
+  // Add signature column to symbols for pre-existing DBs (nullable, old rows safe)
+  try { await db.exec("ALTER TABLE symbols ADD COLUMN signature TEXT"); } catch { /* already present or new DB */ }
   // Clean up orphan rows left by prior runs where foreign_keys was OFF
   await db.exec(`
     DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols);
@@ -166,11 +169,11 @@ export async function getStoredHash(db: Db, path: string): Promise<string | null
 
 export async function insertSymbol(db: Db, sym: SymbolRow): Promise<number> {
   const result = await db.prepare(
-    `INSERT INTO symbols (file_path, file_hash, language, symbol_name, symbol_kind, start_line, end_line, parent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO symbols (file_path, file_hash, language, symbol_name, symbol_kind, start_line, end_line, parent_id, signature)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     sym.file_path, sym.file_hash, sym.language, sym.symbol_name, sym.symbol_kind,
-    sym.start_line, sym.end_line, sym.parent_id ?? null
+    sym.start_line, sym.end_line, sym.parent_id ?? null, sym.signature ?? null
   );
   const id = (result as any).lastInsertRowid as number;
   return id;

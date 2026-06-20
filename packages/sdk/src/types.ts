@@ -17,6 +17,7 @@ export interface SymbolRow {
   start_line: number;
   end_line: number;
   parent_id?: number;
+  signature?: string;   // methods/functions only: e.g. verifyCredentials(String username): boolean
 }
 
 export interface AstNodeRow {

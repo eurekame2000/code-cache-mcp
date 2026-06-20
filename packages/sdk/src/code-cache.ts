@@ -120,7 +120,7 @@ export class CodeCacheStore {
 
     // Generate embeddings asynchronously — don't await, never block storeFile
     const newSymbolRows = await db.prepare(
-      "SELECT id, symbol_kind, symbol_name FROM symbols WHERE file_path = ? AND file_hash = ?"
+      "SELECT id, symbol_kind, symbol_name, signature FROM symbols WHERE file_path = ? AND file_hash = ?"
     ).all(absPath, hash) as any[];
     this.embeddingCacheDirty = true;
     this.symbolIndexDirty = true;
