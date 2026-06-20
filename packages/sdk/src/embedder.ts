@@ -48,21 +48,22 @@ async function embed(text: string): Promise<number[] | null> {
 }
 
 /** Text used to represent a symbol for embedding. */
-export function symbolEmbedText(symbolKind: string, symbolName: string): string {
+export function symbolEmbedText(symbolKind: string, symbolName: string, signature?: string): string {
+  if (signature) return `${symbolKind} ${signature}`;
   return `${symbolKind} ${symbolName}`;
 }
 
 /** Generate + store embeddings for a list of symbols. Fire-and-forget safe. */
 export async function generateEmbeddings(
   db: Db,
-  symbols: { id: number; symbol_kind: string; symbol_name: string }[]
+  symbols: { id: number; symbol_kind: string; symbol_name: string; signature?: string | null }[]
 ): Promise<void> {
   const pipe = await getPipeline();
   if (!pipe) return; // embedding unavailable — graceful skip
 
   for (const sym of symbols) {
     try {
-      const text = symbolEmbedText(sym.symbol_kind, sym.symbol_name);
+      const text = symbolEmbedText(sym.symbol_kind, sym.symbol_name, sym.signature ?? undefined);
       const vec = await embed(text);
       if (vec) await insertEmbedding(db, sym.id, vec, MODEL);
     } catch {

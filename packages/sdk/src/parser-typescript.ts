@@ -22,6 +22,14 @@ function sliceSource(source: string, node: Parser.SyntaxNode): string {
   return source.slice(node.startIndex, node.endIndex);
 }
 
+function buildTsSignature(node: Parser.SyntaxNode, name: string, source: string): string {
+  const params = node.childForFieldName("parameters");
+  const ret = node.childForFieldName("return_type");
+  const p = params ? sliceSource(source, params) : "()";
+  const r = ret ? ` ${sliceSource(source, ret)}` : "";
+  return `${name}${p}${r}`.replace(/\s+/g, " ");
+}
+
 function visitNode(
   node: Parser.SyntaxNode,
   source: string,
@@ -90,6 +98,7 @@ function visitNode(
         symbol_kind: kind, start_line: node.startPosition.row + 1,
         end_line: node.endPosition.row + 1,
         parent_id: parentIdx,
+        signature: buildTsSignature(node, name, source),
       });
       return;
     }
@@ -102,12 +111,14 @@ function visitNode(
           const nameNode = decl.childForFieldName("name");
           const valueNode = decl.childForFieldName("value");
           if (nameNode && valueNode && (valueNode.type === "arrow_function" || valueNode.type === "function")) {
+            const fnName = sliceSource(source, nameNode);
             result.symbols.push({
               file_path: filePath, language: "typescript",
-              symbol_name: sliceSource(source, nameNode),
+              symbol_name: fnName,
               symbol_kind: "function", start_line: node.startPosition.row + 1,
               end_line: node.endPosition.row + 1,
               parent_id: parentIdx,
+              signature: buildTsSignature(valueNode, fnName, source),
             });
           }
         }
