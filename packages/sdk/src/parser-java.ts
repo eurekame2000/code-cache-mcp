@@ -47,14 +47,18 @@ function extractRelationships(
 
   const superclass = classNode.childForFieldName("superclass");
   if (superclass) {
-    // 'superclass' field contains the type_type node, get the type name
-    for (const child of superclass.children) {
-      if (child.type === "type_identifier") {
-        rels.push({ parent_name: sliceSource(source, child), relationship: "extends" });
-      }
-    }
+    let parentName: string | null = null;
     if (superclass.type === "type_identifier") {
-      rels.push({ parent_name: sliceSource(source, superclass), relationship: "extends" });
+      parentName = sliceSource(source, superclass);
+    } else if (superclass.type === "generic_type") {
+      const nameNode = superclass.children.find(c => c.type === "type_identifier");
+      if (nameNode) parentName = sliceSource(source, nameNode);
+    } else if (superclass.type === "scoped_type_identifier") {
+      const nameNode = superclass.childForFieldName("name");
+      if (nameNode) parentName = sliceSource(source, nameNode);
+    }
+    if (parentName) {
+      rels.push({ parent_name: parentName, relationship: "extends" });
     }
   }
 

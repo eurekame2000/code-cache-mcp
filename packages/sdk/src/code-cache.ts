@@ -89,11 +89,8 @@ export class CodeCacheStore {
       return { file_path: absPath, language, symbols_stored: 0, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: true, hash };
     }
 
-    // Invalidate old data if hash changed
-    if (storedHash) {
-      await deleteByFilePath(db, absPath);
-    }
-
+    // Parse first (CPU-heavy, do it outside DB transaction).
+    // If parsing fails, old cache is preserved — no data loss.
     const parser = await getParser(language);
     if (!parser) {
       return { file_path: absPath, language, symbols_stored: 0, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: false, hash };
@@ -101,10 +98,17 @@ export class CodeCacheStore {
 
     const parseResult = parser.parse(source, absPath);
 
-    // All DB writes in one transaction — N individual auto-commits → 1 round-trip
+    // All DB writes in one transaction — includes old data invalidation.
+    // Concurrent queries see either pre-transaction (old) or post-commit (new),
+    // never empty.
     await db.exec("BEGIN");
     const idxToId = new Map<number, number>();
     try {
+      // Invalidate old data INSIDE the transaction, before inserting new
+      if (storedHash) {
+        await deleteByFilePath(db, absPath);
+      }
+
       await insertFileVersion(db, absPath, hash, language, lines);
 
       // Insert symbols — track index→DB id mapping for relationships and call edges
@@ -539,11 +543,13 @@ export class CodeCacheStore {
   }
 
   async onFileChanged(filePath: string): Promise<void> {
+    // Invalidate cache immediately so stale data is never served.
+    // If re-index fails, cache stays empty — callers read the file directly.
+    // Empty results are safer than stale results.
     await this.invalidateFile(filePath);
-    // Re-parse in background — ignore errors (file may be in transient write state)
     try {
       await this.storeFile(filePath);
-    } catch { /* ignore */ }
+    } catch { /* ignore — cache stays empty, next query auto-indexes */ }
   }
 
   async onFileDeleted(filePath: string): Promise<void> {

@@ -231,18 +231,24 @@ export async function deleteByFilePath(db: Db, filePath: string): Promise<number
   ).run(filePath);
   // Delete children (methods/fields with parent_id) before parents (classes) to satisfy
   // the self-referencing symbols.parent_id FK — SQLite checks constraints row-by-row
-  await db.prepare("DELETE FROM symbols WHERE file_path = ? AND parent_id IS NOT NULL").run(filePath);
-  const result = await db.prepare("DELETE FROM symbols WHERE file_path = ?").run(filePath);
+  const childResult = await db.prepare("DELETE FROM symbols WHERE file_path = ? AND parent_id IS NOT NULL").run(filePath);
+  const parentResult = await db.prepare("DELETE FROM symbols WHERE file_path = ?").run(filePath);
   await db.prepare("DELETE FROM file_versions WHERE path = ?").run(filePath);
-  return (result as any).rowsAffected as number ?? 0;
+  const children = (childResult as any).rowsAffected as number ?? 0;
+  const parents = (parentResult as any).rowsAffected as number ?? 0;
+  return children + parents;
 }
 
 export async function resolveParentFks(db: Db, filePath: string): Promise<void> {
-  // Resolve FKs for relationships/edges whose source symbol is from this file
+  // Resolve FKs for relationships/edges whose source symbol is from this file.
+  // Constrain parent lookup to same file to avoid picking wrong symbol by name collision.
   await db.prepare(`
     UPDATE class_relationships
     SET parent_symbol_id = (
-      SELECT id FROM symbols WHERE symbol_name = class_relationships.parent_name LIMIT 1
+      SELECT id FROM symbols
+      WHERE symbol_name = class_relationships.parent_name
+        AND file_path = (SELECT file_path FROM symbols WHERE id = class_relationships.child_symbol_id)
+      LIMIT 1
     )
     WHERE parent_symbol_id IS NULL
       AND child_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)
@@ -251,7 +257,10 @@ export async function resolveParentFks(db: Db, filePath: string): Promise<void> 
   await db.prepare(`
     UPDATE call_edges
     SET callee_id = (
-      SELECT id FROM symbols WHERE symbol_name = call_edges.callee_name LIMIT 1
+      SELECT id FROM symbols
+      WHERE symbol_name = call_edges.callee_name
+        AND file_path = (SELECT file_path FROM symbols WHERE id = call_edges.caller_id)
+      LIMIT 1
     )
     WHERE callee_id IS NULL
       AND caller_id IN (SELECT id FROM symbols WHERE file_path = ?)
