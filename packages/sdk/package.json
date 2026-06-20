@@ -1,0 +1,14 @@
+{
+  "name": "@code-cache/sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@tursodatabase/database": "^0.6.0",
+    "glob": "^11.0.0",
+    "web-tree-sitter": "^0.24.7"
+  }
+}
