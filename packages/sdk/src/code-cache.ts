@@ -18,6 +18,15 @@ function camelAcronym(name: string): string {
   return letters ? letters.join("").toLowerCase() : "";
 }
 
+/** Count newlines without allocating an array (avoids O(n) string objects). */
+function countLines(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 10) n++;
+  }
+  return n + 1; // last line has no trailing newline
+}
+
 export class CodeCacheStore {
   private db: Db | null = null;
   private dbPath: string;
@@ -76,7 +85,7 @@ export class CodeCacheStore {
     const db = this.getDb();
     const source = await readFile(absPath, "utf-8");
     const hash = contentHash(source);
-    const lines = source.split("\n").length;
+    const lines = countLines(source);
 
     const language = options?.language ?? detectLanguage(absPath) ?? "unknown";
     if (language === "unknown") {
