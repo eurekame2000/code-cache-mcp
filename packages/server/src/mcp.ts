@@ -220,22 +220,31 @@ For best results on a new project, call index_directory first.`,
           hits: grouped,
         };
         if (autoIndexedFiles.length > 0) { payload.auto_indexed = true; payload.auto_indexed_files = autoIndexedFiles; }
-        const text = JSON.stringify(payload, null, 2);
-        // tokens_used = accurate API count when ANTHROPIC_API_KEY is set, else chars/4 estimate
-        const tokensUsed = await tracker.count(text);
-        await monitor.record({
-          tool: "query_code_cache",
-          cache_hit: result.cache_hit,
-          tokens_saved: result.tokens_saved_estimate,
-          tokens_used: tokensUsed,
-          hits_count: result.total_hits,
-          symbol: params.symbol,
-          file_path: params.file_path,
-          duration_ms: Date.now() - start,
-        });
+        const text = JSON.stringify(payload);
+        // Truncate very large responses to avoid blowing the context window
+        const MAX_RESPONSE_LENGTH = 50000;
+        const display = text.length > MAX_RESPONSE_LENGTH
+          ? text.slice(0, MAX_RESPONSE_LENGTH) + `\n\n[response truncated at ${MAX_RESPONSE_LENGTH.toLocaleString()} chars; ${result.total_hits} total hits]`
+          : text;
         const stats = await cache.getStats();
         const footer = `\n\n[code-cache-mcp: ~${stats.tokens_saved_session.toLocaleString()} tokens saved this session]`;
-        return { content: [{ type: "text" as const, text: text + footer }] };
+        const responseContent = { content: [{ type: "text" as const, text: display + footer }] };
+
+        // Fire token counting + metrics async — don't block the response
+        tracker.count(text).then(tokensUsed => {
+          monitor.record({
+            tool: "query_code_cache",
+            cache_hit: result.cache_hit,
+            tokens_saved: result.tokens_saved_estimate,
+            tokens_used: tokensUsed,
+            hits_count: result.total_hits,
+            symbol: params.symbol,
+            file_path: params.file_path,
+            duration_ms: Date.now() - start,
+          });
+        }).catch(() => {});
+
+        return responseContent;
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -267,7 +276,7 @@ Supports Java, TypeScript, JavaScript, and Python.`,
           file_path,
           duration_ms: Date.now() - start,
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -336,7 +345,7 @@ Returns counts of files indexed, symbols extracted, and any errors.`,
           errors: errors.length > 0 ? errors.slice(0, 10) : undefined,
           duration_ms: Date.now() - start,
         };
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -358,7 +367,7 @@ Include a brief reason explaining what this location does or why it is relevant.
     async (params) => {
       try {
         const result = await cache.storeAiLocation(params);
-        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -379,7 +388,7 @@ a prior AI session may have already located it.`,
     async (params) => {
       try {
         const locations = await cache.getAiLocations(params);
-        return { content: [{ type: "text" as const, text: JSON.stringify(locations, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(locations) }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
@@ -397,7 +406,7 @@ The FileWatcher calls this automatically on file changes, but you can call it ex
     async ({ file_paths }) => {
       try {
         const results = await Promise.all(file_paths.map(p => cache.invalidateFile(p)));
-        return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(results) }] };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: `Error: ${e.message}` }], isError: true };
       }
