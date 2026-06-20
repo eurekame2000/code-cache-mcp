@@ -299,9 +299,12 @@ export async function getAllEmbeddings(db: Db): Promise<{ symbol_id: number; vec
   }));
 }
 
-export async function loadEmbeddingsMap(db: Db): Promise<Map<number, number[]>> {
-  const rows = await db.prepare("SELECT symbol_id, embedding FROM symbol_embeddings").all();
-  return new Map((rows as any[]).map(r => [r.symbol_id as number, JSON.parse(r.embedding) as number[]]));
+export async function loadEmbeddingsBatch(db: Db, offset: number, limit: number): Promise<{ symbol_id: number; vector: number[] }[]> {
+  const rows = await db.prepare("SELECT symbol_id, embedding FROM symbol_embeddings LIMIT ? OFFSET ?").all(limit, offset);
+  return (rows as any[]).map(r => ({
+    symbol_id: r.symbol_id as number,
+    vector: JSON.parse(r.embedding) as number[],
+  }));
 }
 
 export async function getEmbeddingCount(db: Db): Promise<number> {

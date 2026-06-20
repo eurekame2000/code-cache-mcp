@@ -1,4 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
+import { appendFile } from "fs/promises";
 import { resolve, dirname } from "path";
 
 export interface CallRecord {
@@ -19,6 +20,11 @@ export class MetricsMonitor {
   private sessionId: string;
   private pgClient: any | null = null;
   private pgReady = false;
+  private buffer: string[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushing: Promise<void> | null = null;
+  static readonly FLUSH_INTERVAL = 2000;
+  static readonly MAX_BUFFER = 50;
 
   constructor(metricsDir: string, sessionId: string) {
     this.metricsPath = resolve(metricsDir, "metrics.jsonl");
@@ -65,14 +71,9 @@ export class MetricsMonitor {
       ...record,
     };
 
-    // Always write JSONL
-    try {
-      const dir = dirname(this.metricsPath);
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      appendFileSync(this.metricsPath, JSON.stringify(entry) + "\n", "utf-8");
-    } catch {
-      // don't crash MCP if metrics write fails
-    }
+    // Buffer writes and flush periodically (async, non-blocking)
+    this.buffer.push(JSON.stringify(entry) + "\n");
+    this.scheduleFlush();
 
     // Optionally write to PG
     if (this.pgReady && this.pgClient) {
@@ -124,7 +125,39 @@ export class MetricsMonitor {
     }
   }
 
+  private scheduleFlush(): void {
+    if (this.buffer.length >= MetricsMonitor.MAX_BUFFER) {
+      this.flush();
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => this.flush(), MetricsMonitor.FLUSH_INTERVAL);
+    }
+  }
+
+  private async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.buffer.length === 0) return;
+    if (this.flushing) await this.flushing;
+
+    const lines = this.buffer.join("");
+    this.buffer = [];
+    this.flushing = (async () => {
+      try {
+        const dir = dirname(this.metricsPath);
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        await appendFile(this.metricsPath, lines, "utf-8");
+      } catch {
+        // don't crash MCP if metrics write fails
+      }
+    })();
+    await this.flushing;
+    this.flushing = null;
+  }
+
   async close(): Promise<void> {
+    await this.flush();
     if (this.pgClient) {
       try { await this.pgClient.end(); } catch { /* ignore */ }
     }

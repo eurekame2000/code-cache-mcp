@@ -1,5 +1,5 @@
 import type { Db } from "./db.js";
-import { insertEmbedding, getAllEmbeddings, getEmbeddingCount } from "./db.js";
+import { insertEmbedding, loadEmbeddingsBatch, getEmbeddingCount } from "./db.js";
 
 const MODEL = "Xenova/all-MiniLM-L6-v2";
 
@@ -79,7 +79,7 @@ export interface SemanticHit {
 
 /**
  * Embed `query`, compare against stored vectors, return top-K symbol IDs.
- * Pass `preloaded` to skip the DB fetch (use CodeCacheStore's in-memory cache).
+ * Loads embeddings in batches from SQLite to bound memory usage.
  * Falls back to empty array if embeddings unavailable.
  */
 export async function semanticSearch(
@@ -87,21 +87,25 @@ export async function semanticSearch(
   query: string,
   topK = 10,
   minScore = 0.3,
-  preloaded?: Map<number, number[]>
 ): Promise<SemanticHit[]> {
   const queryVec = await embed(query);
   if (!queryVec) return [];
 
-  const embeddings = preloaded ?? new Map((await getAllEmbeddings(db)).map(e => [e.symbol_id, e.vector]));
-  if (embeddings.size === 0) return [];
+  const BATCH_SIZE = 1000;
+  const total = await getEmbeddingCount(db);
+  if (total === 0) return [];
 
-  const scored: SemanticHit[] = [];
-  for (const [symbol_id, vector] of embeddings) {
-    const score = cosineSimilarity(queryVec, vector);
-    if (score >= minScore) scored.push({ symbol_id, score });
+  const candidates: SemanticHit[] = [];
+
+  for (let offset = 0; offset < total; offset += BATCH_SIZE) {
+    const batch = await loadEmbeddingsBatch(db, offset, BATCH_SIZE);
+    for (const { symbol_id, vector } of batch) {
+      const score = cosineSimilarity(queryVec, vector);
+      if (score >= minScore) candidates.push({ symbol_id, score });
+    }
   }
 
-  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+  return candidates.sort((a, b) => b.score - a.score).slice(0, topK);
 }
 
 export function embeddingAvailable(): boolean {
