@@ -21,6 +21,7 @@ export function detectLanguage(filePath: string): string | null {
     ".jsx": "typescript",
     ".py": "python",
     ".go": "go",
+    ".rs": "rust",
   };
   return map[ext] ?? null;
 }
@@ -39,9 +40,11 @@ export async function initParsers(): Promise<void> {
   const { createTypeScriptParser } = await import("./parser-typescript.js");
   const { createPythonParser } = await import("./parser-python.js");
   const { createGoParser } = await import("./parser-go.js");
+  const { createRustParser } = await import("./parser-rust.js");
 
   registerParser("java", createJavaParser);
   registerParser("typescript", createTypeScriptParser);
   registerParser("python", createPythonParser);
   registerParser("go", createGoParser);
+  registerParser("rust", createRustParser);
 }

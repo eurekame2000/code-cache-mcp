@@ -141,6 +141,8 @@ Model downloads (~23 MB) are cached in `.model-cache/` on first use.
 | TypeScript / TSX | `.ts` `.tsx`        | `tree-sitter-typescript` npm |
 | JavaScript / JSX | `.js` `.mjs` `.jsx` | `tree-sitter-typescript` npm |
 | Python           | `.py`               | `tree-sitter-python` npm     |
+| Go               | `.go`               | `tree-sitter-go` npm         |
+| Rust             | `.rs`               | `tree-sitter-rust` npm       |
 
 
 ---
@@ -158,6 +160,8 @@ code-cache-mcp/
 │   │       ├── parser-java.ts
 │   │       ├── parser-typescript.ts
 │   │       ├── parser-python.ts
+│   │       ├── parser-go.ts
+│   │       ├── parser-rust.ts
 │   │       ├── parser-registry.ts  # Language dispatcher
 │   │       ├── embedder.ts   # Semantic embeddings (all-MiniLM-L6-v2 via @xenova/transformers)
 │   │       └── watcher.ts    # FileWatcher (debounced fs.watch)
@@ -171,6 +175,8 @@ code-cache-mcp/
 │       ├── tree-sitter-java.wasm
 │       ├── tree-sitter-typescript.wasm
 │       ├── tree-sitter-python.wasm
+│       ├── tree-sitter-go.wasm
+│       ├── tree-sitter-rust.wasm
 │       └── tree-sitter.wasm
 ```
 
@@ -208,7 +214,8 @@ npm install
 ### Register with Claude Code / 注册到 Claude Code
 
 ```bash
-claude mcp add code-cache-mcp npx tsx /path/to/code-cache-mcp/packages/server/src/index.ts
+# Run from the project root directory / 在项目根目录下运行
+claude mcp add code-cache-mcp npx tsx "$(pwd)/packages/server/src/index.ts"
 ```
 
 Or add manually to `~/.claude.json` under `mcpServers` / 或手动添加到 `~/.claude.json` 的 `mcpServers` 字段：
@@ -217,7 +224,7 @@ Or add manually to `~/.claude.json` under `mcpServers` / 或手动添加到 `~/.
 "code-cache-mcp": {
   "type": "stdio",
   "command": "npx",
-  "args": ["tsx", "/path/to/code-cache-mcp/packages/server/src/index.ts"]
+  "args": ["tsx", "/absolute/path/to/code-cache-mcp/packages/server/src/index.ts"]
 }
 ```
 
