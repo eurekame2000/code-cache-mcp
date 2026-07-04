@@ -35,16 +35,5 @@ export async function getParser(language: string): Promise<LanguageParser | null
   return parser;
 }
 
-export async function initParsers(): Promise<void> {
-  const { createJavaParser } = await import("./parser-java.js");
-  const { createTypeScriptParser } = await import("./parser-typescript.js");
-  const { createPythonParser } = await import("./parser-python.js");
-  const { createGoParser } = await import("./parser-go.js");
-  const { createRustParser } = await import("./parser-rust.js");
-
-  registerParser("java", createJavaParser);
-  registerParser("typescript", createTypeScriptParser);
-  registerParser("python", createPythonParser);
-  registerParser("go", createGoParser);
-  registerParser("rust", createRustParser);
-}
+// initParsers removed in v0.2.0 — parsers are registered lazily by CodeCacheStore.init()
+// and WASM grammars load on first use via getParser()

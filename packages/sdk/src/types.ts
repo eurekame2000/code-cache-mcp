@@ -1,6 +1,5 @@
 export interface CacheConfig {
   dbPath: string;
-  sessionId: string;
   watchPaths?: string[];
 }
 
@@ -17,18 +16,7 @@ export interface SymbolRow {
   start_line: number;
   end_line: number;
   parent_id?: number;
-  signature?: string;   // methods/functions only: e.g. verifyCredentials(String username): boolean
-}
-
-export interface AstNodeRow {
-  id?: number;
-  symbol_id: number;
-  node_type: string;
-  start_line: number;
-  end_line: number;
-  start_col: number;
-  end_col: number;
-  ast_json?: string;
+  signature?: string;
 }
 
 export interface ClassRelationship {
@@ -82,12 +70,10 @@ export interface SymbolHit {
   file_path: string;
   start_line: number;
   end_line: number;
-  ast?: object;
   parent_symbol?: string;
   relationships?: Array<{ type: RelationshipKind; target: string }>;
   callers?: Array<{ symbol: string; line: number }>;
   callees?: Array<{ name: string; line: number; file_path?: string }>;
-  semantic_score?: number;  // cosine similarity [0,1] when semantic search used
 }
 
 export interface QueryResult {
@@ -109,8 +95,6 @@ export interface CacheStats {
   cache_hits: number;
   cache_misses: number;
   tokens_saved_total: number;
-  tokens_saved_session: number;
-  embeddings_count: number;
 }
 
 export interface LanguageParser {

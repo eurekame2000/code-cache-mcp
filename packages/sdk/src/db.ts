@@ -1,7 +1,7 @@
 import { connect } from "@tursodatabase/database";
 import { createHash } from "crypto";
 import type {
-  SymbolRow, AstNodeRow, ClassRelationship, CallEdge, AiLocation
+  SymbolRow, ClassRelationship, CallEdge, AiLocation
 } from "./types.js";
 
 export type Db = Awaited<ReturnType<typeof connect>>;
@@ -36,20 +36,6 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path, file_hash);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(symbol_kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent_id);
-
-CREATE TABLE IF NOT EXISTS ast_nodes (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  symbol_id  INTEGER NOT NULL,
-  node_type  TEXT NOT NULL,
-  start_line INTEGER NOT NULL,
-  end_line   INTEGER NOT NULL,
-  start_col  INTEGER NOT NULL,
-  end_col    INTEGER NOT NULL,
-  ast_json   TEXT,
-  FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_ast_nodes_symbol ON ast_nodes(symbol_id);
 
 CREATE TABLE IF NOT EXISTS class_relationships (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,27 +78,12 @@ CREATE TABLE IF NOT EXISTS ai_locations (
   FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_ail_session ON ai_locations(session_id);
 CREATE INDEX IF NOT EXISTS idx_ail_file ON ai_locations(file_path);
 CREATE INDEX IF NOT EXISTS idx_ail_located_at ON ai_locations(located_at DESC);
-
-CREATE TABLE IF NOT EXISTS symbol_embeddings (
-  symbol_id  INTEGER PRIMARY KEY,
-  embedding  TEXT NOT NULL,
-  model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
-  FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
-);
 
 CREATE TABLE IF NOT EXISTS stats (
   key   TEXT PRIMARY KEY,
   value INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS session_stats (
-  session_id TEXT NOT NULL,
-  key        TEXT NOT NULL,
-  value      INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (session_id, key)
 );
 
 INSERT OR IGNORE INTO stats(key, value) VALUES
@@ -132,17 +103,19 @@ export function estimateTokens(text: string): number {
 
 export async function initDb(dbPath: string): Promise<Db> {
   const db = await connect(dbPath, { experimental: ["multiprocess_wal"] });
-  // Must be set per-connection — SQLite default is OFF, CASCADE DELETE won't fire without it
   await db.exec("PRAGMA foreign_keys = ON");
   await db.exec(SCHEMA);
-  // Migrate old DBs that stored raw code
-  try { await db.exec("ALTER TABLE file_versions DROP COLUMN content"); } catch { /* already gone or new DB */ }
-  try { await db.exec("ALTER TABLE symbols DROP COLUMN source_snippet"); } catch { /* already gone or new DB */ }
-  // Add signature column to symbols for pre-existing DBs (nullable, old rows safe)
-  try { await db.exec("ALTER TABLE symbols ADD COLUMN signature TEXT"); } catch { /* already present or new DB */ }
-  // Clean up orphan rows left by prior runs where foreign_keys was OFF
+  // Migrate old DBs
+  try { await db.exec("ALTER TABLE file_versions DROP COLUMN content"); } catch {}
+  try { await db.exec("ALTER TABLE symbols DROP COLUMN source_snippet"); } catch {}
+  try { await db.exec("ALTER TABLE symbols ADD COLUMN signature TEXT"); } catch {}
+  // Drop tables removed in v0.2.0
+  try { await db.exec("DROP TABLE IF EXISTS symbol_embeddings"); } catch {}
+  try { await db.exec("DROP TABLE IF EXISTS query_history"); } catch {}
+  try { await db.exec("DROP TABLE IF EXISTS session_stats"); } catch {}
+  try { await db.exec("DROP TABLE IF EXISTS ast_nodes"); } catch {}
+  // Clean up orphan rows
   await db.exec(`
-    DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols);
     DELETE FROM class_relationships WHERE child_symbol_id NOT IN (SELECT id FROM symbols);
   `);
   return db;
@@ -179,16 +152,6 @@ export async function insertSymbol(db: Db, sym: SymbolRow): Promise<number> {
   return id;
 }
 
-export async function insertAstNode(db: Db, node: AstNodeRow): Promise<void> {
-  await db.prepare(
-    `INSERT INTO ast_nodes (symbol_id, node_type, start_line, end_line, start_col, end_col, ast_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    node.symbol_id, node.node_type, node.start_line, node.end_line,
-    node.start_col, node.end_col, node.ast_json ?? null
-  );
-}
-
 export async function insertRelationship(db: Db, rel: ClassRelationship): Promise<void> {
   await db.prepare(
     `INSERT INTO class_relationships (child_symbol_id, parent_name, parent_symbol_id, relationship)
@@ -215,8 +178,6 @@ export async function insertAiLocation(db: Db, loc: AiLocation): Promise<number>
 }
 
 export async function deleteByFilePath(db: Db, filePath: string): Promise<number> {
-  // NULL out nullable FK references before deleting — required for both old DBs (no ON DELETE SET NULL)
-  // and as a safety net for existing tables that predate the schema fix
   await db.prepare(
     `UPDATE class_relationships SET parent_symbol_id = NULL
      WHERE parent_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)`
@@ -229,8 +190,6 @@ export async function deleteByFilePath(db: Db, filePath: string): Promise<number
     `UPDATE ai_locations SET symbol_id = NULL
      WHERE symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)`
   ).run(filePath);
-  // Delete children (methods/fields with parent_id) before parents (classes) to satisfy
-  // the self-referencing symbols.parent_id FK — SQLite checks constraints row-by-row
   const childResult = await db.prepare("DELETE FROM symbols WHERE file_path = ? AND parent_id IS NOT NULL").run(filePath);
   const parentResult = await db.prepare("DELETE FROM symbols WHERE file_path = ?").run(filePath);
   await db.prepare("DELETE FROM file_versions WHERE path = ?").run(filePath);
@@ -240,8 +199,6 @@ export async function deleteByFilePath(db: Db, filePath: string): Promise<number
 }
 
 export async function resolveParentFks(db: Db, filePath: string): Promise<void> {
-  // Resolve FKs for relationships/edges whose source symbol is from this file.
-  // Constrain parent lookup to same file to avoid picking wrong symbol by name collision.
   await db.prepare(`
     UPDATE class_relationships
     SET parent_symbol_id = (
@@ -267,56 +224,22 @@ export async function resolveParentFks(db: Db, filePath: string): Promise<void> 
   `).run(filePath);
 }
 
-export async function incrementStat(db: Db, sessionId: string, key: string, amount = 1): Promise<void> {
+export async function incrementStat(db: Db, key: string, amount = 1): Promise<void> {
   await db.prepare("UPDATE stats SET value = value + ? WHERE key = ?").run(amount, key);
-  await db.prepare(
-    "INSERT INTO session_stats (session_id, key, value) VALUES (?, ?, ?) ON CONFLICT(session_id, key) DO UPDATE SET value = value + ?"
-  ).run(sessionId, key, amount, amount);
 }
 
 export async function batchIncrementStats(
   db: Db,
-  sessionId: string,
   updates: Record<string, number>,
 ): Promise<void> {
   await db.exec("BEGIN");
   try {
     for (const [key, amount] of Object.entries(updates)) {
       await db.prepare("UPDATE stats SET value = value + ? WHERE key = ?").run(amount, key);
-      await db.prepare(
-        "INSERT INTO session_stats (session_id, key, value) VALUES (?, ?, ?) ON CONFLICT(session_id, key) DO UPDATE SET value = value + ?"
-      ).run(sessionId, key, amount, amount);
     }
     await db.exec("COMMIT");
   } catch (e) {
     await db.exec("ROLLBACK");
     throw e;
   }
-}
-
-export async function insertEmbedding(db: Db, symbolId: number, vector: number[], model: string): Promise<void> {
-  await db.prepare(
-    "INSERT OR REPLACE INTO symbol_embeddings (symbol_id, embedding, model) VALUES (?, ?, ?)"
-  ).run(symbolId, JSON.stringify(vector), model);
-}
-
-export async function getAllEmbeddings(db: Db): Promise<{ symbol_id: number; vector: number[] }[]> {
-  const rows = await db.prepare("SELECT symbol_id, embedding FROM symbol_embeddings").all();
-  return (rows as any[]).map(r => ({
-    symbol_id: r.symbol_id as number,
-    vector: JSON.parse(r.embedding) as number[],
-  }));
-}
-
-export async function loadEmbeddingsBatch(db: Db, offset: number, limit: number): Promise<{ symbol_id: number; vector: number[] }[]> {
-  const rows = await db.prepare("SELECT symbol_id, embedding FROM symbol_embeddings LIMIT ? OFFSET ?").all(limit, offset);
-  return (rows as any[]).map(r => ({
-    symbol_id: r.symbol_id as number,
-    vector: JSON.parse(r.embedding) as number[],
-  }));
-}
-
-export async function getEmbeddingCount(db: Db): Promise<number> {
-  const rows = await db.prepare("SELECT COUNT(*) as c FROM symbol_embeddings").all();
-  return (rows[0] as any).c as number;
 }
