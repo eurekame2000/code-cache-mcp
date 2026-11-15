@@ -129,6 +129,16 @@ code-cache-mcp/
 
 ---
 
+## v0.2.1: project scoping & noise fixes / v0.2.1: 项目作用域与去噪
+
+- **Project-scoped queries** — `query_code_cache` defaults to the server's project root (`CODE_CACHE_ROOT` overrides); a shared DB no longer leaks symbols from other projects. Explicit `file_path` filters still work across roots.
+- **Cold-start guard** — auto-index and file watching only start when the directory looks like a real project (package.json / .git / pyproject.toml / go.mod / …). No more indexing `~/Library` or saved-webpage archives.
+- **Minified-file detection** — bundles and machine-generated JS are skipped at parse time.
+- **Call-graph denoising** — unresolved `obj.method()` edges for common built-in names (`get`, `join`, `append`, `update`, …) are filtered; edges resolving to real symbols are always kept.
+- **`force` re-index actually works** — `index_directory(force=true)` now bypasses the hash short-circuit; cached hits report the real stored symbol count instead of 0.
+- **Dedup** — query results dedupe by (name, file, line); per-project `hotness` / counters instead of global ones.
+- **Schema versioning** — DBs from older schema versions are wiped once on startup (structure-only data is cheap to rebuild).
+
 ## v0.2 Changes from v0.1 / v0.2 相比 v0.1 的变化
 
 | Metric              | v0.1    | v0.2    | Change  |

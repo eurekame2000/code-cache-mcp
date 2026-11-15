@@ -2,11 +2,31 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolve, extname, basename } from "path";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readdirSync } from "fs";
 import { readdir, stat, readFile } from "fs/promises";
 
 const SOURCE_EXTENSIONS = new Set([".java", ".ts", ".tsx", ".js", ".mjs", ".jsx", ".py", ".go", ".rs"]);
-const SKIP_DIRS = new Set(["node_modules", ".git", ".code-cache", "dist", "build", "target", "__pycache__"]);
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", ".code-cache", "dist", "build", "target", "__pycache__",
+  ".venv", "venv", "env", "vendor", "site-packages", "bower_components", ".next",
+]);
+const MAX_FILE_BYTES = 1_000_000; // skip files >1MB (bundles, archives)
+
+/** Marker files that identify a real project root (not an archive or system dir). */
+const PROJECT_MARKERS = new Set([
+  "package.json", "tsconfig.json", "pyproject.toml", "setup.py", "setup.cfg",
+  "requirements.txt", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
+  "build.gradle.kts", "settings.gradle", "composer.json", "Gemfile", ".git",
+]);
+
+function isProjectRoot(dir: string): boolean {
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (PROJECT_MARKERS.has(entry)) return true;
+    }
+  } catch { /* unreadable */ }
+  return false;
+}
 
 /** Walk root, return all source files whose filename or content contains symbol. */
 async function findFilesContainingSymbol(symbol: string, root: string, maxFiles = 100): Promise<string[]> {
@@ -23,6 +43,7 @@ async function findFilesContainingSymbol(symbol: string, root: string, maxFiles 
       let st;
       try { st = await stat(full); } catch { continue; }
       if (st.isDirectory()) { queue.push(full); continue; }
+      if (st.size > MAX_FILE_BYTES) continue;
       const ext = extname(entry);
       if (!SOURCE_EXTENSIONS.has(ext)) continue;
       const stem = basename(entry, ext);
@@ -54,6 +75,7 @@ async function collectSourceFiles(root: string): Promise<string[]> {
       let st;
       try { st = await stat(full); } catch { continue; }
       if (st.isDirectory()) { queue.push(full); continue; }
+      if (st.size > MAX_FILE_BYTES) continue;
       if (SOURCE_EXTENSIONS.has(extname(entry))) files.push(full);
     }
   }
@@ -70,6 +92,12 @@ export async function startMcpServer(): Promise<void> {
   const cacheDir = getCacheDir();
   const dbPath = resolve(cacheDir, "code-cache.db");
 
+  // Project scope: queries default to this root, so a shared DB across
+  // launches never leaks symbols from other projects into results.
+  // Override with CODE_CACHE_ROOT when cwd isn't the project root.
+  const projectRoot = resolve(process.env.CODE_CACHE_ROOT ?? process.cwd());
+  const isRealProject = isProjectRoot(projectRoot);
+
   // Lazy imports — don't load SDK until first tool call
   const { CodeCacheStore } = await import("@code-cache/sdk");
   const cache = new CodeCacheStore({ dbPath });
@@ -80,16 +108,19 @@ export async function startMcpServer(): Promise<void> {
   async function ensureWatcher() {
     if (watcherStarted) return;
     watcherStarted = true;
+    // Only watch real project roots — watching an archive or system dir
+    // floods the cache with junk symbols on every file touch.
+    if (!isRealProject) return;
     const { FileWatcher } = await import("@code-cache/sdk");
     const watcher = new FileWatcher(cache);
-    watcher.watch([process.cwd()]);
+    watcher.watch([projectRoot]);
   }
 
-  // Cold-start auto-index: if cache is empty, index cwd in background
-  cache.getStats().then(stats => {
-    if (stats.files_tracked === 0) {
-      const absDir = process.cwd();
-      collectSourceFiles(absDir).then(files => {
+  // Cold-start auto-index: if this project has nothing indexed yet and cwd
+  // is a real project root, index it in the background.
+  cache.countFilesUnder(projectRoot).then(count => {
+    if (count === 0 && isRealProject) {
+      collectSourceFiles(projectRoot).then(files => {
         if (files.length === 0) return;
         const CONCURRENCY = 4;
         (async () => {
@@ -132,12 +163,13 @@ On cache miss, auto-indexes the file and retries — no manual setup needed.`,
           kinds: params.kinds,
           include_relationships: includeRels,
           include_ast: false,
+          scope_root: projectRoot,
         });
 
         // Auto-index on miss: search for files containing the symbol
         let autoIndexed = false;
         if (result.total_hits === 0 && params.symbol) {
-          const searchRoot = process.cwd();
+          const searchRoot = isRealProject ? projectRoot : process.cwd();
           const filesToIndex = await findFilesContainingSymbol(params.symbol, searchRoot);
           if (filesToIndex.length > 0) {
             const CONCURRENCY = 4;
@@ -151,6 +183,7 @@ On cache miss, auto-indexes the file and retries — no manual setup needed.`,
               kinds: params.kinds,
               include_relationships: includeRels,
               include_ast: false,
+              scope_root: projectRoot,
             });
             autoIndexed = true;
           }
@@ -191,12 +224,12 @@ On cache miss, auto-indexes the file and retries — no manual setup needed.`,
         };
         if (autoIndexed) payload.auto_indexed = true;
 
-        // Attach hotness
-        const stats = await cache.getStats();
-        const hotness = stats.files_tracked >= 50 ? "HOT" : stats.files_tracked > 0 ? "WARM" : "COLD";
+        // Attach hotness — scoped to this project, not the global DB
+        const scopeStats = await cache.getStatsUnder(projectRoot);
+        const hotness = scopeStats.files >= 50 ? "HOT" : scopeStats.files > 0 ? "WARM" : "COLD";
         payload.hotness = hotness;
-        payload.files_cached = stats.files_tracked;
-        payload.symbols_cached = stats.symbols_cached;
+        payload.files_cached = scopeStats.files;
+        payload.symbols_cached = scopeStats.symbols;
 
         // Teaching tip on cache hit — positive reinforcement
         if (result.cache_hit && result.total_hits > 0) {
@@ -258,7 +291,7 @@ On cache miss, auto-indexes the file and retries — no manual setup needed.`,
         const CONCURRENCY = 4;
         for (let i = 0; i < files.length; i += CONCURRENCY) {
           const batch = files.slice(i, i + CONCURRENCY);
-          const results = await Promise.allSettled(batch.map(fp => cache.storeFile(fp, {})));
+          const results = await Promise.allSettled(batch.map(fp => cache.storeFile(fp, { force })));
           for (let j = 0; j < results.length; j++) {
             const fp = batch[j];
             const res = results[j];

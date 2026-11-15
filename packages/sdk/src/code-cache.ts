@@ -5,11 +5,63 @@ import {
   initDb, contentHash, insertFileVersion, getStoredHash,
   insertSymbol, insertRelationship, insertCallEdge,
   insertAiLocation, deleteByFilePath, resolveParentFks, incrementStat, batchIncrementStats,
+  countSymbolsInFile,
   type Db,
 } from "./db.js";
 import { detectLanguage, getParser, registerParser } from "./parser-registry.js";
 
 type SymbolIndexEntry = { id: number; name: string; acronym: string; kind: string; filePath: string };
+
+/**
+ * Common built-in / stdlib method names that appear as member calls
+ * (`obj.get()`, `list.join()`). Unresolved call edges with these names are
+ * noise in the call graph and are filtered out at query time. Edges whose
+ * callee resolved to an actual symbol (callee_id set) are always kept.
+ */
+const BUILTIN_CALLEE_NAMES = new Set([
+  // generic object/dict/map
+  "get", "set", "has", "add", "delete", "keys", "values", "entries", "clear",
+  "hasOwnProperty", "assign", "create", "freeze", "defineProperty", "toString",
+  // arrays / iterables
+  "push", "pop", "shift", "unshift", "slice", "splice", "join", "concat",
+  "map", "filter", "reduce", "forEach", "find", "some", "every", "includes",
+  "indexOf", "sort", "reverse", "flat", "flatMap", "append", "extend",
+  "insert", "remove", "discard", "update", "items", "count", "copy",
+  // strings
+  "split", "trim", "trimStart", "trimEnd", "replace", "replaceAll", "match",
+  "toLowerCase", "toUpperCase", "startsWith", "endsWith", "padStart", "padEnd",
+  "charCodeAt", "substring", "repeat", "format", "strip", "encode", "decode",
+  // io
+  "read", "write", "close", "flush", "open",
+  // math / numbers
+  "max", "min", "abs", "floor", "ceil", "round", "sqrt", "pow", "random",
+  "toFixed", "parseInt", "parseFloat", "isNaN",
+  // json / promises / functions
+  "parse", "stringify", "then", "catch", "finally", "call", "apply", "bind",
+  // logging (high-volume, low-signal)
+  "log", "warn", "error", "info", "debug", "trace",
+]);
+
+/** True when `filePath` is inside `root` (path-boundary aware). */
+export function isUnderPath(filePath: string, root: string): boolean {
+  if (filePath === root) return true;
+  return filePath.startsWith(root.endsWith("/") ? root : `${root}/`);
+}
+
+/**
+ * Heuristic: detect minified / machine-generated JS (bundles, saved-page
+ * archives). One line longer than 1000 chars, or >30% of lines longer than
+ * 200 chars, is almost never hand-written source.
+ */
+export function looksMinified(source: string): boolean {
+  const lines = source.split("\n");
+  let longLines = 0;
+  for (const line of lines) {
+    if (line.length > 1000) return true;
+    if (line.length > 200) longLines++;
+  }
+  return lines.length > 0 && longLines / lines.length > 0.3;
+}
 
 /** Extract uppercase initials from a camelCase/PascalCase identifier: "UserService" → "us" */
 function camelAcronym(name: string): string {
@@ -62,13 +114,13 @@ export class CodeCacheStore {
     return this.db;
   }
 
-  async storeFile(filePath: string, options?: { language?: string }): Promise<StoreResult> {
+  async storeFile(filePath: string, options?: { language?: string; force?: boolean }): Promise<StoreResult> {
     await this.init();
     const absPath = resolve(filePath);
 
     // Dedup concurrent indexing of the same file path
     const existing = this.fileIndexLocks.get(absPath);
-    if (existing) {
+    if (existing && !options?.force) {
       const result = await existing;
       const db = this.getDb();
       const source = await readFile(absPath, "utf-8");
@@ -88,7 +140,7 @@ export class CodeCacheStore {
     }
   }
 
-  private async _doStoreFile(absPath: string, options?: { language?: string }): Promise<StoreResult> {
+  private async _doStoreFile(absPath: string, options?: { language?: string; force?: boolean }): Promise<StoreResult> {
     const db = this.getDb();
     const source = await readFile(absPath, "utf-8");
     const hash = contentHash(source);
@@ -99,9 +151,17 @@ export class CodeCacheStore {
       return { file_path: absPath, language, symbols_stored: 0, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: false, hash };
     }
 
+    // Skip minified / machine-generated files — they pollute the symbol
+    // index and are never useful navigation targets.
+    if (looksMinified(source)) {
+      return { file_path: absPath, language, symbols_stored: 0, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: false, hash };
+    }
+
     const storedHash = await getStoredHash(db, absPath);
-    if (storedHash === hash) {
-      return { file_path: absPath, language, symbols_stored: 0, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: true, hash };
+    if (!options?.force && storedHash === hash) {
+      // Report the symbols actually stored for this file, not a misleading 0.
+      const existingSymbols = await countSymbolsInFile(db, absPath);
+      return { file_path: absPath, language, symbols_stored: existingSymbols, classes_found: 0, methods_found: 0, relationships_stored: 0, call_edges_stored: 0, was_cached: true, hash };
     }
 
     const parser = await getParser(language);
@@ -178,10 +238,18 @@ export class CodeCacheStore {
     include_ast?: boolean;
     include_relationships?: boolean;
     limit?: number;
+    /** Restrict results to files under this project root (default scoping). */
+    scope_root?: string;
   }): Promise<QueryResult> {
     await this.init();
     const db = this.getDb();
     const limit = params.limit ?? 20;
+
+    // Scope applies to broad symbol/pattern queries. An explicit file_path
+    // is deliberate user intent and is honored even outside the scope root.
+    const scopeRoot = params.file_path ? undefined : params.scope_root;
+    const inScope = (filePath: string): boolean =>
+      !scopeRoot || isUnderPath(filePath, scopeRoot);
 
     // ── Lexical search only (semantic removed) ──────────────────────────
     let rows: any[] = [];
@@ -210,7 +278,8 @@ export class CodeCacheStore {
         .filter(e =>
           (e.name.includes(queryLower) || e.acronym === queryLower) &&
           (!absFilePath || e.filePath === absFilePath) &&
-          (!kindSet || kindSet.has(e.kind))
+          (!kindSet || kindSet.has(e.kind)) &&
+          inScope(e.filePath)
         )
         .slice(0, limit)
         .map(e => e.id);
@@ -227,6 +296,10 @@ export class CodeCacheStore {
         sql += " AND file_path = ?";
         args.push(resolve(params.file_path));
       }
+      if (scopeRoot) {
+        sql += " AND (file_path = ? OR file_path LIKE ?)";
+        args.push(scopeRoot, `${scopeRoot}/%`);
+      }
       if (params.pattern) {
         sql += " AND symbol_name LIKE ?";
         args.push(`%${params.pattern}%`);
@@ -236,11 +309,21 @@ export class CodeCacheStore {
         args.push(...params.kinds);
       }
       sql += " LIMIT ?";
-      args.push(limit);
+      args.push(limit * 2); // headroom for post-scope dedup
       rows = await db.prepare(sql).all(...args);
     }
 
     // ── Batch-fetch enrichment data ───────────────────────────────────
+    // Dedup identical (name, file, line) rows — legacy caches and repeated
+    // indexing can leave duplicates in the symbols table.
+    const seen = new Set<string>();
+    rows = rows.filter((r: any) => {
+      const key = `${r.symbol_name}\u0000${r.file_path}\u0000${r.start_line}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
     const rowIds = rows.map((r: any) => r.id as number);
     const parentIds = [...new Set(rows.map((r: any) => r.parent_id as number | null).filter((id): id is number => id != null))];
 
@@ -278,7 +361,7 @@ export class CodeCacheStore {
       const symbolNames = [...new Set(rows.map((r: any) => r.symbol_name as string))];
       const namePh = symbolNames.map(() => "?").join(",");
       const callerRowsByName = await db.prepare(
-        `SELECT ce.callee_name, s.symbol_name AS caller_name, ce.call_line
+        `SELECT ce.callee_name, ce.callee_id, s.symbol_name AS caller_name, ce.call_line
          FROM call_edges ce JOIN symbols s ON s.id = ce.caller_id
          WHERE ce.callee_name IN (${namePh})`
       ).all(...symbolNames);
@@ -295,6 +378,9 @@ export class CodeCacheStore {
         callersMap.get(id)!.push({ symbol: r.caller_name as string, line: r.call_line as number });
       }
       for (const r of callerRowsByName as any[]) {
+        // Name-only edges (callee_id unresolved) with common builtin names
+        // are almost always obj.method() noise — skip them.
+        if (!r.callee_id && BUILTIN_CALLEE_NAMES.has(r.callee_name as string)) continue;
         const ids = nameToIds.get(r.callee_name as string) ?? [];
         for (const id of ids) {
           if (!callersMap.has(id)) callersMap.set(id, []);
@@ -313,10 +399,14 @@ export class CodeCacheStore {
       ).all(...rowIds);
       for (const c of calleeRows as any[]) {
         const id = c.caller_id as number;
+        const name = c.callee_name as string;
+        // Unresolved callee with a common builtin name → obj.method() noise.
+        if (!c.callee_file_path && BUILTIN_CALLEE_NAMES.has(name)) continue;
         if (!calleesMap.has(id)) calleesMap.set(id, []);
-        const entry: { name: string; line: number; file_path?: string } = { name: c.callee_name as string, line: c.call_line as number };
+        const entry: { name: string; line: number; file_path?: string } = { name, line: c.call_line as number };
         if (c.callee_file_path) entry.file_path = c.callee_file_path as string;
-        calleesMap.get(id)!.push(entry);
+        const list = calleesMap.get(id)!;
+        if (!list.some(e => e.name === entry.name && e.line === entry.line)) list.push(entry);
       }
     }
 
@@ -431,10 +521,33 @@ export class CodeCacheStore {
     return { file_path: absPath, symbols_removed: removed };
   }
 
+  /** Count distinct indexed files under a root (per-project cold-start check). */
+  async countFilesUnder(root: string): Promise<number> {
+    await this.init();
+    const db = this.getDb();
+    const rows = await db.prepare(
+      "SELECT COUNT(DISTINCT path) AS c FROM file_versions WHERE path = ? OR path LIKE ?"
+    ).all(root, `${root}/%`);
+    return rows.length > 0 ? (rows[0] as any).c as number : 0;
+  }
+
+  /** Per-project stats: indexed files and symbols under a root. */
+  async getStatsUnder(root: string): Promise<{ files: number; symbols: number }> {
+    await this.init();
+    const db = this.getDb();
+    const [fileRows, symbolRows] = await Promise.all([
+      db.prepare("SELECT COUNT(DISTINCT path) AS c FROM file_versions WHERE path = ? OR path LIKE ?").all(root, `${root}/%`),
+      db.prepare("SELECT COUNT(*) AS c FROM symbols WHERE file_path = ? OR file_path LIKE ?").all(root, `${root}/%`),
+    ]);
+    return {
+      files: fileRows.length > 0 ? (fileRows[0] as any).c as number : 0,
+      symbols: symbolRows.length > 0 ? (symbolRows[0] as any).c as number : 0,
+    };
+  }
+
   async getStats(): Promise<CacheStats> {
     await this.init();
     const db = this.getDb();
-
     const [files, symbols, aiLocs, hits, misses, tokens] = await Promise.all([
       db.prepare("SELECT COUNT(DISTINCT path) as c FROM file_versions").all(),
       db.prepare("SELECT COUNT(*) as c FROM symbols").all(),
@@ -480,5 +593,10 @@ export class CodeCacheStore {
 
   async onFileDeleted(filePath: string): Promise<void> {
     await this.invalidateFile(filePath);
+  }
+
+  /** Test hook: force the in-memory symbol index to rebuild on next query. */
+  _forceSymbolIndexDirty(): void {
+    this.symbolIndexDirty = true;
   }
 }

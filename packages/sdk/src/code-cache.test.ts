@@ -1,20 +1,101 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync, unlinkSync, existsSync } from 'fs';
+import { mkdtempSync, readdirSync, unlinkSync, existsSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join, resolve } from 'path';
+import { tmpdir } from 'os';
 import { CodeCacheStore } from './code-cache.js';
 
+// ── Synthetic Java corpus (machine-independent, no personal paths) ───────────
+const CORPUS = mkdtempSync(join(tmpdir(), 'cc-java-corpus-'));
+
+function java(body: string): string {
+  return body.trimStart();
+}
+
+// LowestSetBit.java: 1 class, 3 methods (constructor + 2 static methods)
+const LOWEST_SET_BIT = join(CORPUS, 'main', 'LowestSetBit.java');
+mkdirSync(join(CORPUS, 'main'), { recursive: true });
+writeFileSync(LOWEST_SET_BIT, java(`
+public class LowestSetBit {
+    public LowestSetBit() { }
+
+    public static int isolateLowestSetBit(int n) {
+        return n & -n;
+    }
+
+    public static int clearLowestSetBit(int n) {
+        return n & (n - 1);
+    }
+}
+`));
+
+// LowestSetBitTest.java: 7 test methods, each calling isolateLowestSetBit
+const LOWEST_SET_BIT_TEST = join(CORPUS, 'main', 'LowestSetBitTest.java');
+writeFileSync(LOWEST_SET_BIT_TEST, java(`
+public class LowestSetBitTest {
+    public void testZero() { assert isolateLowestSetBit(0) == 0; }
+    public void testOne() { assert isolateLowestSetBit(1) == 1; }
+    public void testTwo() { assert isolateLowestSetBit(2) == 2; }
+    public void testThree() { assert isolateLowestSetBit(3) == 1; }
+    public void testPowerOfTwo() { assert isolateLowestSetBit(16) == 16; }
+    public void testMixed() { assert isolateLowestSetBit(12) == 4; }
+    public void testNegative() { assert isolateLowestSetBit(-4) == 4; }
+}
+`));
+
+// IterativeBinarySearch implements SearchAlgorithm
+const SEARCHES_DIR = join(CORPUS, 'searches');
+mkdirSync(SEARCHES_DIR, { recursive: true });
+const ITERATIVE_BINARY_SEARCH = join(SEARCHES_DIR, 'IterativeBinarySearch.java');
+writeFileSync(ITERATIVE_BINARY_SEARCH, java(`
+public class IterativeBinarySearch implements SearchAlgorithm {
+    @Override
+    public <T extends Comparable<T>> int find(T[] array, T key) {
+        int low = 0;
+        int high = array.length - 1;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            int cmp = array[mid].compareTo(key);
+            if (cmp == 0) return mid;
+            if (cmp < 0) low = mid + 1; else high = mid - 1;
+        }
+        return -1;
+    }
+}
+`));
+
+// searches/: several *Search classes for substring-superset tests
+for (const [name, extra] of [
+  ['BinarySearch', 'implements SearchAlgorithm'],
+  ['LinearSearch', 'implements SearchAlgorithm'],
+  ['JumpSearch', 'implements SearchAlgorithm'],
+  ['ExponentialSearch', 'implements SearchAlgorithm'],
+] as const) {
+  writeFileSync(join(SEARCHES_DIR, `${name}.java`), java(`
+public class ${name} ${extra} {
+    public <T extends Comparable<T>> int find(T[] array, T key) {
+        return -1;
+    }
+}
+`));
+}
+
+// 60 filler files so random-sampling tests have a non-trivial corpus
+const GEN_DIR = join(CORPUS, 'gen');
+mkdirSync(GEN_DIR, { recursive: true });
+for (let i = 0; i < 60; i++) {
+  const id = String(i).padStart(2, '0');
+  writeFileSync(join(GEN_DIR, `Gen${id}Util.java`), java(`
+public class Gen${id}Util {
+    public int gen${id}Alpha(int x) { return x + ${i}; }
+    public int gen${id}Beta(int x) { return x * ${i + 1}; }
+    public static String gen${id}Tag() { return "gen${id}"; }
+}
+`));
+}
+
 // ── Test data paths ───────────────────────────────────────────────────────────
-const JAVA_MASTER = resolve('/tmp/mcp/Java-master/src/main/java');
-const LOWEST_SET_BIT = resolve(
-  '/tmp/mcp/Java-master/src/main/java/com/thealgorithms/bitmanipulation/LowestSetBit.java'
-);
-const LOWEST_SET_BIT_TEST = resolve(
-  '/tmp/mcp/Java-master/src/test/java/com/thealgorithms/bitmanipulation/LowestSetBitTest.java'
-);
-const ITERATIVE_BINARY_SEARCH = resolve(
-  '/tmp/mcp/Java-master/src/main/java/com/thealgorithms/searches/IterativeBinarySearch.java'
-);
+const JAVA_MASTER = CORPUS;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const tmpDbs: string[] = [];
@@ -57,6 +138,7 @@ after(() => {
   for (const p of tmpDbs) {
     try { if (existsSync(p)) unlinkSync(p); } catch { /* ignore */ }
   }
+  rmSync(CORPUS, { recursive: true, force: true });
 });
 
 // ── 1. storeFile 基础正确性 ───────────────────────────────────────────────────
@@ -74,7 +156,8 @@ describe('storeFile correctness', () => {
     await store.storeFile(LOWEST_SET_BIT);
     const r2 = await store.storeFile(LOWEST_SET_BIT);
     assert.equal(r2.was_cached, true);
-    assert.equal(r2.symbols_stored, 0);
+    // Cached path reports the symbols actually stored, not a misleading 0.
+    assert.ok(r2.symbols_stored > 0, `expected symbols_stored > 0, got ${r2.symbols_stored}`);
   });
 
   test('stores correct class and method counts', async () => {
@@ -211,9 +294,7 @@ describe('randomized query correctness', { timeout: 120_000 }, () => {
   test('substring query returns superset of exact match', async () => {
     const store = newTestStore();
     // Index several search files
-    const searchDir = resolve(
-      '/tmp/mcp/Java-master/src/main/java/com/thealgorithms/searches'
-    );
+    const searchDir = SEARCHES_DIR;
     const files = readdirSync(searchDir)
       .filter(f => f.endsWith('.java'))
       .map(f => join(searchDir, f));

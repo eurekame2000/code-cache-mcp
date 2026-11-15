@@ -86,12 +86,20 @@ CREATE TABLE IF NOT EXISTS stats (
   value INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 INSERT OR IGNORE INTO stats(key, value) VALUES
   ('tokens_saved', 0),
   ('cache_hits', 0),
   ('cache_misses', 0),
   ('files_parsed', 0);
 `;
+
+/** Bump when schema semantics change in a way that invalidates existing rows. */
+const SCHEMA_VERSION = "0.3";
 
 export function contentHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
@@ -118,7 +126,31 @@ export async function initDb(dbPath: string): Promise<Db> {
   await db.exec(`
     DELETE FROM class_relationships WHERE child_symbol_id NOT IN (SELECT id FROM symbols);
   `);
+
+  // Schema-version migration: wipe data tables when the DB predates the
+  // current schema semantics (e.g. v0.1 rows, or caches poisoned by
+  // cross-project auto-indexing). Structure-only data is cheap to rebuild.
+  const metaRows = await db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").all();
+  const storedVersion = metaRows.length > 0 ? (metaRows[0] as any).value as string : null;
+  if (storedVersion !== SCHEMA_VERSION) {
+    await db.exec(`
+      DELETE FROM ai_locations;
+      DELETE FROM call_edges;
+      DELETE FROM class_relationships;
+      DELETE FROM symbols;
+      DELETE FROM file_versions;
+    `);
+    await db.prepare(
+      "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)"
+    ).run(SCHEMA_VERSION);
+  }
   return db;
+}
+
+/** Count symbols currently stored for a file (used to report cache-hit counts). */
+export async function countSymbolsInFile(db: Db, filePath: string): Promise<number> {
+  const rows = await db.prepare("SELECT COUNT(*) AS c FROM symbols WHERE file_path = ?").all(filePath);
+  return rows.length > 0 ? (rows[0] as any).c as number : 0;
 }
 
 export async function insertFileVersion(

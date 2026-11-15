@@ -7,8 +7,16 @@ dist/
 *.db-shm
 *.db-wal
 
+# Secrets & local environment
+.env
+.env.*
+*.pem
+*.key
+
 # Dev notes
 db-queries.md
+CLAUDE.md
+_workspace/
 
 # Teaching workspace
 lessons/
